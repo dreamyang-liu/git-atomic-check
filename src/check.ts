@@ -1,72 +1,42 @@
 /**
- * Atomicity checking functions
+ * Atomicity checking functions (LLM-only)
  */
 
-import { c, THRESHOLDS } from './config.js';
-import { analyzeFileRelatedness, analyzeMessage } from './analysis.js';
+import { c } from './config.js';
 import { analyzeWithLLM } from './llm.js';
-import type { CommitInfo, AtomicityReport, LLMAnalysis } from './types.js';
+import type { CommitInfo, AtomicityReport } from './types.js';
 
 export async function checkCommitAtomicity(
   commit: CommitInfo,
-  strict: boolean,
-  useLLM: boolean,
   model: string
 ): Promise<AtomicityReport> {
-  const th = strict ? THRESHOLDS.strict : THRESHOLDS.normal;
   const issues: string[] = [];
   const warnings: string[] = [];
   const suggestions: string[] = [];
-  const scores: number[] = [];
-
-  // File count
-  if (commit.filesChanged > th.maxFiles) {
-    issues.push(`Too many files: ${commit.filesChanged} (max: ${th.maxFiles})`);
-    scores.push(Math.max(0, 1 - (commit.filesChanged - th.maxFiles) / th.maxFiles));
-  } else scores.push(1);
-
-  // Line count
-  const totalLines = commit.insertions + commit.deletions;
-  const maxLines = th.maxInsertions + th.maxDeletions;
-  if (totalLines > maxLines) {
-    issues.push(`Too many lines: +${commit.insertions}/-${commit.deletions} (max: ${maxLines})`);
-    scores.push(Math.max(0, 1 - (totalLines - maxLines) / maxLines));
-  } else scores.push(1);
-
-  // File relatedness
-  const { score: relScore, issues: relIssues } = analyzeFileRelatedness(commit.files);
-  issues.push(...relIssues);
-  scores.push(relScore);
-
-  // Message quality
-  const { score: msgScore, issues: msgIssues, suggestions: msgSuggestions } = analyzeMessage(commit.message);
-  issues.push(...msgIssues);
-  suggestions.push(...msgSuggestions);
-  scores.push(msgScore);
 
   // LLM analysis
-  let llmAnalysis: LLMAnalysis | undefined;
-  if (useLLM) {
-    process.stdout.write(`  ${c.dim}Analyzing with LLM...${c.reset}`);
-    llmAnalysis = await analyzeWithLLM(commit, model) || undefined;
-    process.stdout.write('\r' + ' '.repeat(40) + '\r');
+  process.stdout.write(`  ${c.dim}Analyzing with LLM...${c.reset}`);
+  const llmAnalysis = await analyzeWithLLM(commit, model) || undefined;
+  process.stdout.write('\r' + ' '.repeat(40) + '\r');
 
-    if (llmAnalysis) {
-      const llmScore = llmAnalysis.isAtomic ? 1 : 0.3;
-      scores.push(llmScore * llmAnalysis.confidence);
-      if (!llmAnalysis.isAtomic) {
-        issues.push(...llmAnalysis.concerns);
-        if (llmAnalysis.splitSuggestion) suggestions.push(`LLM: ${llmAnalysis.splitSuggestion}`);
+  let score = 50; // Default score
+  let isAtomic = false;
+
+  if (llmAnalysis) {
+    score = llmAnalysis.isAtomic ? (llmAnalysis.confidence * 100) : (30 + llmAnalysis.confidence * 20);
+    isAtomic = llmAnalysis.isAtomic && llmAnalysis.confidence > 0.6;
+
+    if (!llmAnalysis.isAtomic) {
+      issues.push(...llmAnalysis.concerns);
+      if (llmAnalysis.splitSuggestion) {
+        suggestions.push(`LLM: ${llmAnalysis.splitSuggestion}`);
       }
     }
+  } else {
+    warnings.push('LLM analysis failed');
   }
 
-  const finalScore = (scores.reduce((a, b) => a + b, 0) / scores.length) * 100;
-  const isAtomic = useLLM && llmAnalysis
-    ? llmAnalysis.isAtomic && llmAnalysis.confidence > 0.6 && issues.length <= 2
-    : issues.length === 0 && finalScore >= 70;
-
-  return { commit, isAtomic, score: finalScore, issues, warnings, suggestions, llmAnalysis };
+  return { commit, isAtomic, score, issues, warnings, suggestions, llmAnalysis };
 }
 
 export function printReport(report: AtomicityReport, verbose: boolean): void {

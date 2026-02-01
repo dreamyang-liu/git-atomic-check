@@ -138,3 +138,51 @@ Only output the JSON.`;
     return JSON.parse(match[0]);
   } catch { return null; }
 }
+
+export interface PatchFixRequest {
+  originalDiff: string;
+  failedPatch: string;
+  patchIndex: number;
+  totalPatches: number;
+  error: string;
+  allPatches: Array<{ message: string; diff: string }>;
+}
+
+export async function fixPatch(request: PatchFixRequest, model: string): Promise<string | null> {
+  const prompt = `You are a git expert. A patch failed to apply with \`git apply\`. Fix the patch.
+
+**Original Commit Diff:**
+\`\`\`diff
+${request.originalDiff}
+\`\`\`
+
+**Failed Patch (${request.patchIndex + 1}/${request.totalPatches}):**
+\`\`\`diff
+${request.failedPatch}
+\`\`\`
+
+**Error from git apply:**
+\`\`\`
+${request.error}
+\`\`\`
+
+**All Patches in the Split Plan:**
+${request.allPatches.map((p, i) => `Patch ${i + 1}: ${p.message}\n\`\`\`diff\n${p.diff.slice(0, 500)}${p.diff.length > 500 ? '\n...(truncated)' : ''}\n\`\`\``).join('\n\n')}
+
+TASK: Fix patch ${request.patchIndex + 1} so it can be applied successfully.
+
+Common issues to check:
+1. Line numbers in @@ headers must be accurate
+2. Context lines (lines starting with space) must match the original file exactly
+3. The patch must not overlap with other patches
+4. Ensure proper newlines and no trailing whitespace issues
+
+Respond with ONLY the fixed diff, starting with "diff --git". No explanation, no JSON, just the raw diff.`;
+
+  const response = await callBedrock(prompt, model, 16384);
+  if (!response) return null;
+
+  // Extract the diff from the response
+  const diffMatch = response.match(/diff --git[\s\S]*/);
+  return diffMatch ? diffMatch[0].trim() + '\n' : null;
+}

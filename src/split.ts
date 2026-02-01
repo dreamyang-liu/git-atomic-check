@@ -5,8 +5,61 @@
 import { c } from './config.js';
 import { runGit, getCommitInfo } from './git.js';
 import { generateSplitPlan } from './llm.js';
-import { validateAndFixPatch } from './patch.js';
 import type { CommitInfo, SplitPlan } from './types.js';
+import { spawnSync } from 'child_process';
+
+/**
+ * Validate patches in a temporary worktree at HEAD~1
+ * This ensures patches will apply correctly before we reset
+ */
+async function validatePatchesInWorktree(
+  plan: SplitPlan
+): Promise<{ valid: boolean; errors: string[] }> {
+  const fs = await import('fs');
+  const path = await import('path');
+  const os = await import('os');
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'git-fission-verify-'));
+  const errors: string[] = [];
+
+  try {
+    // Create a temporary worktree at HEAD~1
+    console.log(`  ${c.dim}Creating temporary worktree for validation...${c.reset}`);
+    const { ok: worktreeOk, output: worktreeOut } = runGit(['worktree', 'add', '--detach', tmpDir, 'HEAD~1']);
+    if (!worktreeOk) {
+      return { valid: false, errors: [`Failed to create worktree: ${worktreeOut}`] };
+    }
+
+    // Save patches and validate each one
+    for (let i = 0; i < plan.splits.length; i++) {
+      const split = plan.splits[i];
+      const patchFile = path.join(tmpDir, `patch-${i}.patch`);
+      fs.writeFileSync(patchFile, split.diff);
+
+      // Run git apply --check in the worktree directory
+      const result = spawnSync('git', ['apply', '--check', patchFile], {
+        cwd: tmpDir,
+        encoding: 'utf-8',
+      });
+
+      if (result.status !== 0) {
+        const errorMsg = result.stderr || result.stdout || 'Unknown error';
+        errors.push(`Patch ${i + 1} (${split.message.slice(0, 30)}): ${errorMsg.trim()}`);
+      }
+    }
+
+    return { valid: errors.length === 0, errors };
+  } finally {
+    // Cleanup worktree
+    try {
+      runGit(['worktree', 'remove', '--force', tmpDir]);
+    } catch { /* ignore */ }
+    // Also try to remove the directory if worktree remove failed
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch { /* ignore */ }
+  }
+}
 
 export async function executeSplit(commit: CommitInfo, plan: SplitPlan, dryRun: boolean): Promise<boolean> {
   const fs = await import('fs');
@@ -118,7 +171,7 @@ export async function executeSplit(commit: CommitInfo, plan: SplitPlan, dryRun: 
   return true;
 }
 
-export async function splitCommit(commitRef: string, model: string, dryRun: boolean, maxRetries = 2): Promise<boolean> {
+export async function splitCommit(commitRef: string, model: string, dryRun: boolean): Promise<boolean> {
   console.log(`${c.bold}Analyzing commit for split...${c.reset}`);
 
   const { ok, output: hash } = runGit(['rev-parse', commitRef]);
@@ -135,58 +188,37 @@ export async function splitCommit(commitRef: string, model: string, dryRun: bool
 
   console.log(`  Commit: ${commit.shortHash} - ${commit.message.slice(0, 50)}`);
   console.log(`  Files: ${commit.filesChanged}, Lines: +${commit.insertions}/-${commit.deletions}`);
-  if (commit.diff?.includes('(truncated)')) {
+  if (commit.diff?.endsWith('(truncated)')) {
     console.log(`  ${c.yellow}Note: Diff truncated to 200KB for analysis${c.reset}`);
   }
 
-  let plan: SplitPlan | null = null;
-  let lastErrors: string[] = [];
-
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    if (attempt > 0) {
-      console.log(`\n${c.yellow}Retrying (attempt ${attempt + 1}/${maxRetries + 1})...${c.reset}`);
-    }
-
-    console.log(`\n${c.dim}Generating split plan with LLM...${c.reset}`);
-    plan = await generateSplitPlan(commit, model, lastErrors);
-
-    if (!plan) {
-      console.log(`${c.red}Error: LLM failed to generate a split plan.${c.reset}`);
-      continue;
-    }
-
-    if (plan.splits.length < 2) {
-      console.log(`${c.green}LLM determined this commit is already atomic.${c.reset}`);
-      return true;
-    }
-
-    // Validate patches before executing
-    const validationResults = plan.splits.map((split, i) => validateAndFixPatch(split.diff, i));
-    lastErrors = validationResults.flatMap(r => r.errors);
-
-    if (lastErrors.length === 0) {
-      // Apply fixes
-      validationResults.forEach((result, i) => {
-        plan!.splits[i].diff = result.fixed;
-      });
-      break;
-    }
-
-    console.log(`\n${c.yellow}Patch validation found issues:${c.reset}`);
-    lastErrors.forEach(err => console.log(`  ${c.yellow}•${c.reset} ${err}`));
-
-    if (attempt === maxRetries) {
-      console.log(`\n${c.red}Failed to generate valid patches after ${maxRetries + 1} attempts.${c.reset}`);
-      console.log(`${c.yellow}Try running with --dry-run to see the generated patches, or manually split the commit.${c.reset}`);
-      return false;
-    }
-  }
+  console.log(`\n${c.dim}Generating split plan with LLM...${c.reset}`);
+  const plan = await generateSplitPlan(commit, model);
 
   if (!plan) {
     console.log(`${c.red}Error: LLM failed to generate a split plan.${c.reset}`);
     console.log(`${c.yellow}This may be due to the diff being too large or complex.${c.reset}`);
     return false;
   }
+
+  if (plan.splits.length < 2) {
+    console.log(`${c.green}LLM determined this commit is already atomic.${c.reset}`);
+    return true;
+  }
+
+  // Validate patches in a temporary worktree before proceeding
+  console.log(`\n${c.dim}Validating patches against HEAD~1...${c.reset}`);
+  const { valid, errors } = await validatePatchesInWorktree(plan);
+
+  if (!valid) {
+    console.log(`\n${c.red}Patch validation failed:${c.reset}`);
+    errors.forEach(err => console.log(`  ${c.red}•${c.reset} ${err}`));
+    console.log(`\n${c.yellow}The generated patches may not apply cleanly.${c.reset}`);
+    console.log(`${c.yellow}Try running with --dry-run to inspect the patches.${c.reset}`);
+    return false;
+  }
+
+  console.log(`  ${c.green}✓${c.reset} All patches validated successfully`);
 
   return executeSplit(commit, plan, dryRun);
 }

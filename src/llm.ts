@@ -87,56 +87,138 @@ Only output the JSON.`;
   } catch { return null; }
 }
 
-export async function generateSplitPlan(commit: CommitInfo, model: string, previousErrors: string[] = []): Promise<SplitPlan | null> {
-  const errorFeedback = previousErrors.length > 0
-    ? `\n\n**IMPORTANT - Previous attempt had these errors, please fix them:**\n${previousErrors.map(e => `- ${e}`).join('\n')}\n`
-    : '';
+import { parseDiffIntoHunks, rebuildPatchFromHunks, type ParsedFileDiff } from './git.js';
 
-  const prompt = `You are a git expert. Split this commit's diff into multiple atomic commits.
+/**
+ * Hunk classification result from LLM
+ */
+export interface HunkClassification {
+  commits: Array<{
+    message: string;
+    description: string;
+    hunkIds: number[];
+  }>;
+  reasoning: string;
+}
+
+/**
+ * Format hunk content for LLM display - show actual changes
+ */
+function formatHunkForLLM(hunk: { id: number; startLine: number; content: string }, maxLines: number = 15): string {
+  const lines = hunk.content.split('\n');
+  const changedLines = lines.filter(l => l.startsWith('+') || l.startsWith('-'));
+
+  // Show up to maxLines of actual changes
+  const displayLines = changedLines.slice(0, maxLines);
+  let display = displayLines.map(l => `    ${l}`).join('\n');
+
+  if (changedLines.length > maxLines) {
+    display += `\n    ... (${changedLines.length - maxLines} more lines)`;
+  }
+
+  return display;
+}
+
+/**
+ * Ask LLM to classify hunks into commits
+ */
+export async function classifyHunks(
+  commit: CommitInfo,
+  files: ParsedFileDiff[],
+  model: string
+): Promise<HunkClassification | null> {
+  // Build display for LLM - show hunks with their IDs and actual diff content
+  let hunksDisplay = '';
+  for (const file of files) {
+    hunksDisplay += `\n**${file.filePath}:**\n`;
+    for (const hunk of file.hunks) {
+      hunksDisplay += `  [Hunk ${hunk.id}] starting at line ${hunk.startLine}:\n`;
+      hunksDisplay += formatHunkForLLM(hunk) + '\n';
+    }
+  }
+
+  const prompt = `You are a git expert. Analyze this commit and decide how to split it into atomic commits.
 
 **Original Commit Message:** ${commit.message}
+**Files Changed:** ${commit.filesChanged}
+**Stats:** +${commit.insertions}/-${commit.deletions} lines
 
-**Full Diff:**
-\`\`\`diff
-${commit.diff || '(diff not available)'}
-\`\`\`
-${errorFeedback}
-Split this into 2-5 atomic commits. For each commit, output the EXACT unified diff format that can be applied with \`git apply\`.
+**Hunks to classify (each hunk is a contiguous block of changes):**
+${hunksDisplay}
 
-CRITICAL RULES:
-1. Each split must contain a valid unified diff (starting with "diff --git")
-2. The diffs must be complete - include all headers (diff --git, index, ---, +++)
-3. Every hunk from the original diff must appear in exactly ONE split
-4. Do not modify the diff content, just partition it
-5. Hunk headers (@@ -X,Y +A,B @@) must have ACCURATE line counts:
-   - Y = number of lines starting with '-' or ' ' (context) in the hunk
-   - B = number of lines starting with '+' or ' ' (context) in the hunk
-6. Each diff must end with a newline
+TASK: Classify each hunk into one of 2-5 atomic commits. Each commit should do ONE logical thing.
 
-Respond in JSON format:
+Rules:
+1. Every hunk ID must appear in exactly ONE commit
+2. Related changes should stay together (e.g., a function and its callers)
+3. Hunks from the same file that are related should go together
+4. Import statement hunks should go with the code that uses them
+
+Respond in JSON:
 {
   "reasoning": "Brief explanation of how you're splitting this",
-  "splits": [
+  "commits": [
     {
-      "message": "feat(auth): Add login endpoint",
+      "message": "feat(auth): Add login function",
       "description": "What this commit does",
-      "diff": "diff --git a/file.ts b/file.ts\\nindex abc..def 100644\\n--- a/file.ts\\n+++ b/file.ts\\n@@ -1,3 +1,4 @@\\n+new line\\n existing"
+      "hunkIds": [0, 2, 5]
     }
   ]
 }
 
-IMPORTANT: In the JSON, escape newlines as \\n in the diff field.
+If the commit is already atomic, return a single commit with all hunk IDs.
 Only output the JSON.`;
 
-  const response = await callBedrock(prompt, model, 32768);
-  console.log(response);
-  if (!response) return null;
+  const response = await callBedrock(prompt, model, 8192);
+  if (!response) {
+    console.error('  LLM returned no response');
+    return null;
+  }
 
   try {
     const match = response.match(/\{[\s\S]*\}/);
-    if (!match) return null;
+    if (!match) {
+      console.error('  No JSON found in response:', response.slice(0, 200));
+      return null;
+    }
     return JSON.parse(match[0]);
-  } catch { return null; }
+  } catch (e) {
+    console.error('  Failed to parse JSON:', e);
+    return null;
+  }
+}
+
+/**
+ * Generate split plan using hunk-level classification
+ */
+export async function generateSplitPlan(commit: CommitInfo, model: string): Promise<SplitPlan | null> {
+  if (!commit.diff) return null;
+
+  // Parse diff into hunks
+  const files = parseDiffIntoHunks(commit.diff);
+
+  const totalHunks = files.reduce((sum, f) => sum + f.hunks.length, 0);
+  if (totalHunks === 0) {
+    return null;
+  }
+
+  console.log(`  ${totalHunks} hunks across ${files.length} files`);
+
+  // Ask LLM to classify hunks
+  const classification = await classifyHunks(commit, files, model);
+  if (!classification) return null;
+
+  // Build patches from hunk classification
+  const splits = classification.commits.map(c => ({
+    message: c.message,
+    description: c.description,
+    diff: rebuildPatchFromHunks(files, c.hunkIds),
+  }));
+
+  return {
+    reasoning: classification.reasoning,
+    splits,
+  };
 }
 
 export interface PatchFixRequest {
@@ -146,9 +228,21 @@ export interface PatchFixRequest {
   totalPatches: number;
   error: string;
   allPatches: Array<{ message: string; diff: string }>;
+  targetFileContent?: string;  // The actual file content at HEAD~1
+  targetFilePath?: string;     // The file path being patched
 }
 
 export async function fixPatch(request: PatchFixRequest, model: string): Promise<string | null> {
+  const fileContentSection = request.targetFileContent && request.targetFilePath
+    ? `\n**Full file content at HEAD~1 (${request.targetFilePath}):**
+\`\`\`
+${request.targetFileContent.slice(0, 15000)}${request.targetFileContent.length > 15000 ? '\n...(truncated)' : ''}
+\`\`\`
+
+IMPORTANT: The context lines (lines starting with space) in your patch MUST exactly match the lines in this file.
+`
+    : '';
+
   const prompt = `You are a git expert. A patch failed to apply with \`git apply\`. Fix the patch.
 
 **Original Commit Diff:**
@@ -165,7 +259,7 @@ ${request.failedPatch}
 \`\`\`
 ${request.error}
 \`\`\`
-
+${fileContentSection}
 **All Patches in the Split Plan:**
 ${request.allPatches.map((p, i) => `Patch ${i + 1}: ${p.message}\n\`\`\`diff\n${p.diff.slice(0, 500)}${p.diff.length > 500 ? '\n...(truncated)' : ''}\n\`\`\``).join('\n\n')}
 

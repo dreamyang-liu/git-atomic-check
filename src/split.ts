@@ -6,60 +6,6 @@ import { c } from './config.js';
 import { runGit, getCommitInfo } from './git.js';
 import { generateSplitPlan } from './llm.js';
 import type { CommitInfo, SplitPlan } from './types.js';
-import { spawnSync } from 'child_process';
-
-/**
- * Validate patches in a temporary worktree at HEAD~1
- * This ensures patches will apply correctly before we reset
- */
-async function validatePatchesInWorktree(
-  plan: SplitPlan
-): Promise<{ valid: boolean; errors: string[] }> {
-  const fs = await import('fs');
-  const path = await import('path');
-  const os = await import('os');
-
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'git-fission-verify-'));
-  const errors: string[] = [];
-
-  try {
-    // Create a temporary worktree at HEAD~1
-    console.log(`  ${c.dim}Creating temporary worktree for validation...${c.reset}`);
-    const { ok: worktreeOk, output: worktreeOut } = runGit(['worktree', 'add', '--detach', tmpDir, 'HEAD~1']);
-    if (!worktreeOk) {
-      return { valid: false, errors: [`Failed to create worktree: ${worktreeOut}`] };
-    }
-
-    // Save patches and validate each one
-    for (let i = 0; i < plan.splits.length; i++) {
-      const split = plan.splits[i];
-      const patchFile = path.join(tmpDir, `patch-${i}.patch`);
-      fs.writeFileSync(patchFile, split.diff);
-
-      // Run git apply --check in the worktree directory
-      const result = spawnSync('git', ['apply', '--check', patchFile], {
-        cwd: tmpDir,
-        encoding: 'utf-8',
-      });
-
-      if (result.status !== 0) {
-        const errorMsg = result.stderr || result.stdout || 'Unknown error';
-        errors.push(`Patch ${i + 1} (${split.message.slice(0, 30)}): ${errorMsg.trim()}`);
-      }
-    }
-
-    return { valid: errors.length === 0, errors };
-  } finally {
-    // Cleanup worktree
-    try {
-      runGit(['worktree', 'remove', '--force', tmpDir]);
-    } catch { /* ignore */ }
-    // Also try to remove the directory if worktree remove failed
-    try {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    } catch { /* ignore */ }
-  }
-}
 
 export async function executeSplit(commit: CommitInfo, plan: SplitPlan, dryRun: boolean): Promise<boolean> {
   const fs = await import('fs');
@@ -205,20 +151,6 @@ export async function splitCommit(commitRef: string, model: string, dryRun: bool
     console.log(`${c.green}LLM determined this commit is already atomic.${c.reset}`);
     return true;
   }
-
-  // Validate patches in a temporary worktree before proceeding
-  console.log(`\n${c.dim}Validating patches against HEAD~1...${c.reset}`);
-  const { valid, errors } = await validatePatchesInWorktree(plan);
-
-  if (!valid) {
-    console.log(`\n${c.red}Patch validation failed:${c.reset}`);
-    errors.forEach(err => console.log(`  ${c.red}•${c.reset} ${err}`));
-    console.log(`\n${c.yellow}The generated patches may not apply cleanly.${c.reset}`);
-    console.log(`${c.yellow}Try running with --dry-run to inspect the patches.${c.reset}`);
-    return false;
-  }
-
-  console.log(`  ${c.green}✓${c.reset} All patches validated successfully`);
 
   return executeSplit(commit, plan, dryRun);
 }

@@ -87,56 +87,129 @@ Only output the JSON.`;
   } catch { return null; }
 }
 
-export async function generateSplitPlan(commit: CommitInfo, model: string, previousErrors: string[] = []): Promise<SplitPlan | null> {
-  const errorFeedback = previousErrors.length > 0
-    ? `\n\n**IMPORTANT - Previous attempt had these errors, please fix them:**\n${previousErrors.map(e => `- ${e}`).join('\n')}\n`
-    : '';
+import { parseDiffWithLines, rebuildPatchFromLineIds, type ParsedDiffWithLines, type ChangedLine } from './git.js';
 
-  const prompt = `You are a git expert. Split this commit's diff into multiple atomic commits.
+/**
+ * Line classification result from LLM
+ */
+export interface LineClassification {
+  commits: Array<{
+    message: string;
+    description: string;
+    lineIds: number[];
+  }>;
+  reasoning: string;
+}
+
+/**
+ * Ask LLM to classify changed lines into commits
+ */
+export async function classifyLines(
+  commit: CommitInfo,
+  parsed: ParsedDiffWithLines,
+  model: string
+): Promise<LineClassification | null> {
+  // Group lines by file for display
+  const linesByFile = new Map<string, ChangedLine[]>();
+  for (const line of parsed.lines) {
+    if (!linesByFile.has(line.filePath)) {
+      linesByFile.set(line.filePath, []);
+    }
+    linesByFile.get(line.filePath)!.push(line);
+  }
+
+  // Build display for LLM
+  let linesDisplay = '';
+  for (const [filePath, lines] of linesByFile) {
+    linesDisplay += `\n**${filePath}:**\n`;
+    for (const line of lines) {
+      const prefix = line.type;
+      const content = line.content.length > 60 ? line.content.slice(0, 60) + '...' : line.content;
+      linesDisplay += `  [${line.id}] ${prefix}${content}\n`;
+    }
+  }
+
+  const prompt = `You are a git expert. Analyze this commit and decide how to split it into atomic commits.
 
 **Original Commit Message:** ${commit.message}
+**Files Changed:** ${commit.filesChanged}
+**Stats:** +${commit.insertions}/-${commit.deletions} lines
 
-**Full Diff:**
-\`\`\`diff
-${commit.diff || '(diff not available)'}
-\`\`\`
-${errorFeedback}
-Split this into 2-5 atomic commits. For each commit, output the EXACT unified diff format that can be applied with \`git apply\`.
+**Changed lines to classify:**
+${linesDisplay}
 
-CRITICAL RULES:
-1. Each split must contain a valid unified diff (starting with "diff --git")
-2. The diffs must be complete - include all headers (diff --git, index, ---, +++)
-3. Every hunk from the original diff must appear in exactly ONE split
-4. Do not modify the diff content, just partition it
-5. Hunk headers (@@ -X,Y +A,B @@) must have ACCURATE line counts:
-   - Y = number of lines starting with '-' or ' ' (context) in the hunk
-   - B = number of lines starting with '+' or ' ' (context) in the hunk
-6. Each diff must end with a newline
+TASK: Classify each line into one of 2-5 atomic commits. Each commit should do ONE logical thing.
 
-Respond in JSON format:
+Rules:
+1. Every line ID must appear in exactly ONE commit
+2. Related changes should stay together (e.g., a function and its callers)
+3. If a - line and + line are a replacement pair (same logical change), keep them together
+4. Import statements should go with the code that uses them
+
+Respond in JSON:
 {
   "reasoning": "Brief explanation of how you're splitting this",
-  "splits": [
+  "commits": [
     {
-      "message": "feat(auth): Add login endpoint",
+      "message": "feat(auth): Add login function",
       "description": "What this commit does",
-      "diff": "diff --git a/file.ts b/file.ts\\nindex abc..def 100644\\n--- a/file.ts\\n+++ b/file.ts\\n@@ -1,3 +1,4 @@\\n+new line\\n existing"
+      "lineIds": [0, 2, 5]
     }
   ]
 }
 
-IMPORTANT: In the JSON, escape newlines as \\n in the diff field.
+If the commit is already atomic, return a single commit with all line IDs.
 Only output the JSON.`;
 
-  const response = await callBedrock(prompt, model, 32768);
-  console.log(response);
-  if (!response) return null;
+  const response = await callBedrock(prompt, model, 8192);
+  if (!response) {
+    console.error('  LLM returned no response');
+    return null;
+  }
 
   try {
     const match = response.match(/\{[\s\S]*\}/);
-    if (!match) return null;
+    if (!match) {
+      console.error('  No JSON found in response:', response.slice(0, 200));
+      return null;
+    }
     return JSON.parse(match[0]);
-  } catch { return null; }
+  } catch (e) {
+    console.error('  Failed to parse JSON:', e);
+    return null;
+  }
+}
+
+/**
+ * Generate split plan using line-level classification
+ */
+export async function generateSplitPlan(commit: CommitInfo, model: string): Promise<SplitPlan | null> {
+  if (!commit.diff) return null;
+
+  // Parse diff with line-level granularity
+  const parsed = parseDiffWithLines(commit.diff);
+
+  if (parsed.lines.length === 0) {
+    return null;
+  }
+
+  console.log(`  ${parsed.lines.length} changed lines across ${parsed.files.length} files`);
+
+  // Ask LLM to classify lines
+  const classification = await classifyLines(commit, parsed, model);
+  if (!classification) return null;
+
+  // Rebuild patches from classification
+  const splits = classification.commits.map(c => ({
+    message: c.message,
+    description: c.description,
+    diff: rebuildPatchFromLineIds(parsed, c.lineIds),
+  }));
+
+  return {
+    reasoning: classification.reasoning,
+    splits,
+  };
 }
 
 export interface PatchFixRequest {
@@ -146,9 +219,21 @@ export interface PatchFixRequest {
   totalPatches: number;
   error: string;
   allPatches: Array<{ message: string; diff: string }>;
+  targetFileContent?: string;  // The actual file content at HEAD~1
+  targetFilePath?: string;     // The file path being patched
 }
 
 export async function fixPatch(request: PatchFixRequest, model: string): Promise<string | null> {
+  const fileContentSection = request.targetFileContent && request.targetFilePath
+    ? `\n**Full file content at HEAD~1 (${request.targetFilePath}):**
+\`\`\`
+${request.targetFileContent.slice(0, 15000)}${request.targetFileContent.length > 15000 ? '\n...(truncated)' : ''}
+\`\`\`
+
+IMPORTANT: The context lines (lines starting with space) in your patch MUST exactly match the lines in this file.
+`
+    : '';
+
   const prompt = `You are a git expert. A patch failed to apply with \`git apply\`. Fix the patch.
 
 **Original Commit Diff:**
@@ -165,7 +250,7 @@ ${request.failedPatch}
 \`\`\`
 ${request.error}
 \`\`\`
-
+${fileContentSection}
 **All Patches in the Split Plan:**
 ${request.allPatches.map((p, i) => `Patch ${i + 1}: ${p.message}\n\`\`\`diff\n${p.diff.slice(0, 500)}${p.diff.length > 500 ? '\n...(truncated)' : ''}\n\`\`\``).join('\n\n')}
 

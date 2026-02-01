@@ -16,7 +16,6 @@ async function main() {
   const args = process.argv.slice(2);
 
   const flags = {
-    n: undefined as number | undefined,
     verbose: false,
     model: process.env.GIT_FISSION_MODEL || DEFAULT_MODEL,
     split: undefined as string | undefined,
@@ -27,8 +26,7 @@ async function main() {
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
-    if (arg === '-n' || arg === '--number') flags.n = parseInt(args[++i]);
-    else if (arg === '-v' || arg === '--verbose') flags.verbose = true;
+    if (arg === '-v' || arg === '--verbose') flags.verbose = true;
     else if (arg === '--model') flags.model = args[++i];
     else if (arg === '--split') flags.split = args[++i];
     else if (arg === '--split-model') flags.splitModel = args[++i];
@@ -41,11 +39,13 @@ async function main() {
 ${LOGO}
 Usage: git-fission [options]
 
+By default, checks the last unpushed commit for atomicity.
+Use --split to split a non-atomic commit into smaller pieces.
+
 Options:
-  -n, --number <n>     Check last n unpushed commits
   -v, --verbose        Verbose output
-  --model <id>         Bedrock model ID for analysis
-  --split <commit>     Split a commit into atomic commits
+  --model <id>         Bedrock model ID for check analysis
+  --split <commit>     Split a commit into atomic commits (default: HEAD)
   --split-model <id>   Model for split analysis
   --dry-run            Preview split without executing
   -h, --help           Show help
@@ -53,7 +53,7 @@ Options:
 Environment:
   AWS_BEARER_TOKEN_BEDROCK   Bearer token for Bedrock
   AWS_REGION                 AWS region (default: us-west-2)
-  GIT_FISSION_MODEL          Default model for analysis
+  GIT_FISSION_MODEL          Default model for check
   GIT_FISSION_SPLIT_MODEL    Default model for split
 `);
     process.exit(0);
@@ -72,42 +72,34 @@ Environment:
     process.exit(success ? 0 : 1);
   }
 
-  // Check mode
-  const commits = getUnpushedCommits(flags.n);
+  // Check mode - only check the last unpushed commit
+  const commits = getUnpushedCommits(1);
   if (!commits.length) {
     console.log(`${c.green}✓ No unpushed commits to check${c.reset}`);
     process.exit(0);
   }
 
-  console.log(LOGO);
-  console.log(`${c.bold}Checking ${commits.length} unpushed commit(s)...${c.reset} [LLM: ${flags.model.split('/').pop()}]`);
-
-  let allAtomic = true;
-  let totalScore = 0;
-
-  for (const hash of commits.reverse()) {
-    const commit = getCommitInfo(hash, true);
-    if (!commit) {
-      console.log(`${c.yellow}Warning: Could not get info for ${hash.slice(0, 8)}${c.reset}`);
-      continue;
-    }
-
-    const report = await checkCommitAtomicity(commit, flags.model);
-    printReport(report, flags.verbose);
-
-    if (!report.isAtomic) allAtomic = false;
-    totalScore += report.score;
+  const hash = commits[0];
+  const commit = getCommitInfo(hash, true);
+  if (!commit) {
+    console.log(`${c.red}Error: Could not get info for ${hash.slice(0, 8)}${c.reset}`);
+    process.exit(1);
   }
 
-  const avgScore = totalScore / commits.length;
+  console.log(LOGO);
+  console.log(`${c.bold}Checking last unpushed commit...${c.reset} [LLM: ${flags.model.split('/').pop()}]`);
+
+  const report = await checkCommitAtomicity(commit, flags.model);
+  printReport(report, flags.verbose);
+
   console.log(`\n${c.bold}${'─'.repeat(50)}${c.reset}`);
 
-  if (allAtomic) {
-    console.log(`${c.green}✓ All ${commits.length} commits are atomic!${c.reset} (avg score: ${avgScore.toFixed(0)}/100)`);
+  if (report.isAtomic) {
+    console.log(`${c.green}✓ Commit is atomic!${c.reset} (score: ${report.score.toFixed(0)}/100)`);
     process.exit(0);
   } else {
-    console.log(`${c.red}✗ Some commits are not atomic${c.reset} (avg score: ${avgScore.toFixed(0)}/100)`);
-    console.log(`\n${c.yellow}Tip: Use 'git-fission --split HEAD' to split the last commit.${c.reset}`);
+    console.log(`${c.red}✗ Commit is not atomic${c.reset} (score: ${report.score.toFixed(0)}/100)`);
+    console.log(`\n${c.yellow}Tip: Use 'git-fission --split HEAD' to split this commit.${c.reset}`);
     process.exit(1);
   }
 }

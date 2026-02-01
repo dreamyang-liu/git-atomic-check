@@ -45,30 +45,15 @@ ln -s "$(pwd)/dist/index.js" ~/.local/bin/git-fission
 ### Check commits for atomicity
 
 ```bash
-# Check all unpushed commits (fast, offline)
-git-fission
-
-# Check with LLM analysis (requires AWS credentials)
-git-fission --llm
-
-# Check last N commits
-git-fission -n 3
-
-# Use stricter thresholds
-git-fission --strict
+# Check all unpushed commits
+git-fission --model us.anthropic.claude-opus-4-5-20251101-v1:0
 ```
 
 ### Split a commit
 
 ```bash
 # Split the last commit into atomic pieces
-git-fission --split HEAD
-
-# Preview the split without executing
-git-fission --split HEAD --dry-run
-
-# Split a specific commit
-git-fission --split abc1234
+git-fission --split HEAD --model us.anthropic.claude-opus-4-5-20251101-v1:0
 ```
 
 ## How it works
@@ -119,7 +104,6 @@ mno7890 test: Add user authentication tests
 | `-n, --number <n>` | Check last n unpushed commits |
 | `--strict` | Use stricter thresholds |
 | `-v, --verbose` | Verbose output |
-| `--llm` | Use LLM for semantic analysis |
 | `--model <id>` | Bedrock model ID for analysis |
 | `--split <commit>` | Split a commit into atomic commits |
 | `--split-model <id>` | Model for split analysis |
@@ -139,21 +123,20 @@ mno7890 test: Add user authentication tests
 
 | Model | Use Case |
 |-------|----------|
-| `us.anthropic.claude-3-5-haiku-20241022-v1:0` | Default for `--llm` (fast) |
-| `us.anthropic.claude-sonnet-4-20250514-v1:0` | Default for `--split` (accurate) |
+| `us.anthropic.claude-3-5-haiku-20241022-v1:0` | Default for check (fast) |
+| `us.anthropic.claude-sonnet-4-20250514-v1:0` | Default for split (accurate) |
 
 ## Features
 
-- **Heuristic Analysis**: Fast offline check for file count, line count, directory spread, message quality
 - **LLM Analysis**: Deep semantic analysis using AWS Bedrock Claude models
-- **Auto-Split**: Automatically split large commits into atomic ones using LLM
+- **Auto-Split**: Automatically split large commits into atomic ones
 - **Patch Validation**: Validates and auto-fixes common LLM patch generation issues
 - **Retry Logic**: Automatically retries with feedback if patch generation fails
 
 ## Requirements
 
 - Node.js 18+
-- AWS credentials configured (for LLM features)
+- AWS credentials configured
 - Git repository
 
 ## License

@@ -9,7 +9,7 @@
  * 4. Has a clear, descriptive commit message
  */
 
-import { execSync } from 'child_process';
+import { spawnSync } from 'child_process';
 import { BedrockRuntimeClient, ConverseCommand } from '@aws-sdk/client-bedrock-runtime';
 
 // Colors
@@ -84,11 +84,16 @@ interface SplitPlan {
 
 // Git helpers
 function runGit(args: string[]): { ok: boolean; output: string } {
-  try {
-    const output = execSync(`git ${args.join(' ')}`, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
-    return { ok: true, output: output.trim() };
-  } catch (e: any) {
-    return { ok: false, output: e.message };
+  const result = spawnSync('git', args, {
+    encoding: 'utf-8',
+    maxBuffer: 10 * 1024 * 1024, // 10MB buffer for large diffs
+  });
+
+  if (result.status === 0) {
+    return { ok: true, output: (result.stdout || '').trim() };
+  } else {
+    const errorMsg = result.stderr || result.error?.message || 'Unknown error';
+    return { ok: false, output: errorMsg.toString().trim() };
   }
 }
 
@@ -117,10 +122,9 @@ function getUnpushedCommits(n?: number): string[] {
   return output.split('\n').filter(Boolean);
 }
 
-function getCommitInfo(hash: string, includeDiff = false): CommitInfo | null {
+function getCommitInfo(hash: string, includeDiff: boolean | 'full' = false): CommitInfo | null {
   const { ok, output } = runGit(['show', hash, '--format=%H%n%h%n%s%n%an', '--stat', '--stat-width=1000']);
   if (!ok) return null;
-
   const lines = output.split('\n');
   if (lines.length < 4) return null;
 
@@ -140,9 +144,19 @@ function getCommitInfo(hash: string, includeDiff = false): CommitInfo | null {
 
   let diff = '';
   if (includeDiff) {
-    const { ok: diffOk, output: diffOut } = runGit(['show', hash, '--no-stat', '-p']);
-    if (diffOk) {
-      diff = diffOut.length > 8000 ? diffOut.slice(0, 8000) + '\n... (truncated)' : diffOut;
+    const { ok: diffOk, output: diffOut } = runGit(['show', hash, '--format=', '-p']);
+    if (diffOk && diffOut) {
+      const maxDiff = includeDiff === 'full' ? 200000 : 8000;
+      if (includeDiff === 'full' && diffOut.length > maxDiff) {
+        console.error(`  ${c.red}Error: Diff is too large (${Math.round(diffOut.length / 1024)}KB > 200KB limit)${c.reset}`);
+        console.error(`  ${c.yellow}Please split this commit manually into smaller chunks first.${c.reset}`);
+        console.error(`  ${c.dim}Tip: Use 'git reset HEAD~1' to unstage, then create smaller commits.${c.reset}`);
+        return null;
+      }
+      diff = diffOut.length > maxDiff ? diffOut.slice(0, maxDiff) + '\n... (truncated)' : diffOut;
+    } else {
+      console.error(`  ${c.yellow}Warning: Failed to get diff (ok=${diffOk})${c.reset}`);
+      if (diffOut) console.error(`  ${c.dim}Error: ${diffOut}${c.reset}`);
     }
   }
 
@@ -197,6 +211,7 @@ async function callBedrock(prompt: string, model: string, maxTokens = 1024): Pro
     const body = JSON.stringify({
       messages: [{ role: 'user', content: [{ text: prompt }] }],
       inferenceConfig: { maxTokens, temperature: 0.1 },
+      anthropic_beta: ['context-1m-2025-08-07']
     });
 
     try {
@@ -268,7 +283,11 @@ Only output the JSON.`;
   } catch { return null; }
 }
 
-async function generateSplitPlan(commit: CommitInfo, model: string): Promise<SplitPlan | null> {
+async function generateSplitPlan(commit: CommitInfo, model: string, previousErrors: string[] = []): Promise<SplitPlan | null> {
+  const errorFeedback = previousErrors.length > 0
+    ? `\n\n**IMPORTANT - Previous attempt had these errors, please fix them:**\n${previousErrors.map(e => `- ${e}`).join('\n')}\n`
+    : '';
+
   const prompt = `You are a git expert. Split this commit's diff into multiple atomic commits.
 
 **Original Commit Message:** ${commit.message}
@@ -277,7 +296,7 @@ async function generateSplitPlan(commit: CommitInfo, model: string): Promise<Spl
 \`\`\`diff
 ${commit.diff || '(diff not available)'}
 \`\`\`
-
+${errorFeedback}
 Split this into 2-5 atomic commits. For each commit, output the EXACT unified diff format that can be applied with \`git apply\`.
 
 CRITICAL RULES:
@@ -285,6 +304,10 @@ CRITICAL RULES:
 2. The diffs must be complete - include all headers (diff --git, index, ---, +++)
 3. Every hunk from the original diff must appear in exactly ONE split
 4. Do not modify the diff content, just partition it
+5. Hunk headers (@@ -X,Y +A,B @@) must have ACCURATE line counts:
+   - Y = number of lines starting with '-' or ' ' (context) in the hunk
+   - B = number of lines starting with '+' or ' ' (context) in the hunk
+6. Each diff must end with a newline
 
 Respond in JSON format:
 {
@@ -301,7 +324,8 @@ Respond in JSON format:
 IMPORTANT: In the JSON, escape newlines as \\n in the diff field.
 Only output the JSON.`;
 
-  const response = await callBedrock(prompt, model, 8192);
+  const response = await callBedrock(prompt, model, 32768);
+  console.log(response);
   if (!response) return null;
 
   try {
@@ -404,6 +428,56 @@ function printReport(report: AtomicityReport, verbose: boolean) {
     commit.files.slice(0, 10).forEach(f => console.log(`    • ${f}`));
     if (commit.files.length > 10) console.log(`    ... and ${commit.files.length - 10} more`);
   }
+}
+
+/**
+ * Validate and fix common issues with a patch
+ * Returns { valid: boolean, fixed: string, errors: string[], warnings: string[] }
+ */
+function validateAndFixPatch(diff: string, index: number): { valid: boolean; fixed: string; errors: string[]; warnings: string[] } {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  let fixed = diff;
+
+  // Fix 1: Unescape literal \n that should be newlines (common LLM issue)
+  if (fixed.includes('\\n') && !fixed.includes('\n')) {
+    fixed = fixed.replace(/\\n/g, '\n');
+  }
+
+  // Fix 2: Ensure trailing newline
+  if (!fixed.endsWith('\n')) {
+    fixed += '\n';
+  }
+
+  // Fix 3: Remove any leading/trailing whitespace on the whole patch
+  fixed = fixed.trim() + '\n';
+
+  // Validation checks
+  const lines = fixed.split('\n');
+
+  // Check 1: Must start with "diff --git"
+  if (!lines[0]?.startsWith('diff --git')) {
+    errors.push(`Patch ${index + 1}: Missing "diff --git" header`);
+  }
+
+  // Check 2: Must have --- and +++ lines
+  const hasMinusLine = lines.some(l => l.startsWith('--- '));
+  const hasPlusLine = lines.some(l => l.startsWith('+++ '));
+  if (!hasMinusLine || !hasPlusLine) {
+    errors.push(`Patch ${index + 1}: Missing --- or +++ file headers`);
+  }
+
+  // Check 3: Must have at least one hunk header (@@ ... @@)
+  const hasHunk = lines.some(l => l.startsWith('@@') && l.includes('@@', 2));
+  if (!hasHunk) {
+    errors.push(`Patch ${index + 1}: Missing hunk header (@@ ... @@)`);
+  }
+
+  // Note: We skip strict hunk line count validation here.
+  // Off-by-one mismatches are common due to "\ No newline at end of file" markers
+  // and context line handling. Let git apply --check do the authoritative validation.
+
+  return { valid: errors.length === 0, fixed, errors, warnings };
 }
 
 async function executeSplit(commit: CommitInfo, plan: SplitPlan, dryRun: boolean): Promise<boolean> {
@@ -517,16 +591,16 @@ async function executeSplit(commit: CommitInfo, plan: SplitPlan, dryRun: boolean
   return true;
 }
 
-async function splitCommit(commitRef: string, model: string, dryRun: boolean): Promise<boolean> {
+async function splitCommit(commitRef: string, model: string, dryRun: boolean, maxRetries = 2): Promise<boolean> {
   console.log(`${c.bold}Analyzing commit for split...${c.reset}`);
-  
+
   const { ok, output: hash } = runGit(['rev-parse', commitRef]);
   if (!ok) {
     console.log(`${c.red}Error: Invalid commit reference${c.reset}`);
     return false;
   }
 
-  const commit = getCommitInfo(hash.trim(), true);
+  const commit = getCommitInfo(hash.trim(), 'full');
   if (!commit) {
     console.log(`${c.red}Error: Could not get commit info${c.reset}`);
     return false;
@@ -534,13 +608,57 @@ async function splitCommit(commitRef: string, model: string, dryRun: boolean): P
 
   console.log(`  Commit: ${commit.shortHash} - ${commit.message.slice(0, 50)}`);
   console.log(`  Files: ${commit.filesChanged}, Lines: +${commit.insertions}/-${commit.deletions}`);
+  if (commit.diff?.includes('(truncated)')) {
+    console.log(`  ${c.yellow}Note: Diff truncated to 200KB for analysis${c.reset}`);
+  }
 
-  console.log(`\n${c.dim}Generating split plan with LLM...${c.reset}`);
-  const plan = await generateSplitPlan(commit, model);
+  let plan: SplitPlan | null = null;
+  let lastErrors: string[] = [];
 
-  if (!plan || plan.splits.length < 2) {
-    console.log(`${c.green}LLM determined this commit is already atomic.${c.reset}`);
-    return true;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (attempt > 0) {
+      console.log(`\n${c.yellow}Retrying (attempt ${attempt + 1}/${maxRetries + 1})...${c.reset}`);
+    }
+
+    console.log(`\n${c.dim}Generating split plan with LLM...${c.reset}`);
+    plan = await generateSplitPlan(commit, model, lastErrors);
+
+    if (!plan) {
+      console.log(`${c.red}Error: LLM failed to generate a split plan.${c.reset}`);
+      continue;
+    }
+
+    if (plan.splits.length < 2) {
+      console.log(`${c.green}LLM determined this commit is already atomic.${c.reset}`);
+      return true;
+    }
+
+    // Validate patches before executing
+    const validationResults = plan.splits.map((split, i) => validateAndFixPatch(split.diff, i));
+    lastErrors = validationResults.flatMap(r => r.errors);
+
+    if (lastErrors.length === 0) {
+      // Apply fixes
+      validationResults.forEach((result, i) => {
+        plan!.splits[i].diff = result.fixed;
+      });
+      break;
+    }
+
+    console.log(`\n${c.yellow}Patch validation found issues:${c.reset}`);
+    lastErrors.forEach(err => console.log(`  ${c.yellow}•${c.reset} ${err}`));
+
+    if (attempt === maxRetries) {
+      console.log(`\n${c.red}Failed to generate valid patches after ${maxRetries + 1} attempts.${c.reset}`);
+      console.log(`${c.yellow}Try running with --dry-run to see the generated patches, or manually split the commit.${c.reset}`);
+      return false;
+    }
+  }
+
+  if (!plan) {
+    console.log(`${c.red}Error: LLM failed to generate a split plan.${c.reset}`);
+    console.log(`${c.yellow}This may be due to the diff being too large or complex.${c.reset}`);
+    return false;
   }
 
   return executeSplit(commit, plan, dryRun);

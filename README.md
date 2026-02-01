@@ -42,10 +42,10 @@ ln -s "$(pwd)/dist/index.js" ~/.local/bin/git-fission
 
 ## Usage
 
-### Check commits for atomicity
+### Check the last unpushed commit
 
 ```bash
-# Check all unpushed commits
+# Check the last unpushed commit for atomicity
 git-fission --model us.anthropic.claude-opus-4-5-20251101-v1:0
 ```
 
@@ -101,14 +101,14 @@ mno7890 test: Add user authentication tests
 
 | Option | Description |
 |--------|-------------|
-| `-n, --number <n>` | Check last n unpushed commits |
-| `--strict` | Use stricter thresholds |
 | `-v, --verbose` | Verbose output |
-| `--model <id>` | Bedrock model ID for analysis |
-| `--split <commit>` | Split a commit into atomic commits |
+| `--model <id>` | Bedrock model ID for check analysis |
+| `--split <commit>` | Split a commit into atomic commits (default: HEAD) |
 | `--split-model <id>` | Model for split analysis |
 | `--dry-run` | Preview split without executing |
 | `-h, --help` | Show help |
+
+> **Note**: By default, git-fission checks only the last unpushed commit.
 
 ## Environment Variables
 

@@ -23,6 +23,8 @@ async function main() {
     dryRun: false,
     help: false,
     instruction: undefined as string | undefined,
+    lineLevel: false,
+    debug: false,
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -34,6 +36,8 @@ async function main() {
     else if (arg === '--dry-run') flags.dryRun = true;
     else if (arg === '-h' || arg === '--help') flags.help = true;
     else if (arg === '--instruction' || arg === '-i') flags.instruction = args[++i];
+    else if (arg === '--line-level' || arg === '-L') flags.lineLevel = true;
+    else if (arg === '--debug') flags.debug = true;
   }
 
   if (flags.help) {
@@ -49,7 +53,9 @@ Options:
   --model <id>         Bedrock model ID for check analysis
   --split <commit>     Split a commit into atomic commits (default: HEAD)
   --split-model <id>   Model for split analysis
+  -L, --line-level     Use line-level splitting (finer granularity than hunk-level)
   --dry-run            Preview split without executing
+  --debug              Write intermediate results to .git-fission-debug/ for debugging
   -i, --instruction    Custom instruction for the LLM (e.g., "Keep test files separate")
   -h, --help           Show help
 
@@ -71,7 +77,7 @@ Environment:
 
   // Split mode
   if (flags.split) {
-    const success = await splitCommit(flags.split, flags.splitModel, flags.dryRun, false, flags.instruction);
+    const success = await splitCommit(flags.split, flags.splitModel, flags.dryRun, flags.lineLevel, flags.instruction, flags.debug);
     process.exit(success ? 0 : 1);
   }
 

@@ -11,12 +11,20 @@
     "start": "node dist/index.js",
     "dev": "ts-node src/index.ts"
   },
-  "keywords": ["git", "commit", "atomic", "split", "fission", "ai", "cli"],
+  "keywords": [
+    "git",
+    "commit",
+    "atomic",
+    "split",
+    "fission",
+    "ai",
+    "cli"
+  ],
   "author": "Mengyang Liu",
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^20.0.0",
-    "@types/node-fetch": "^2.6.0",
+    "@types/node-fetch": "^2.6.13",
     "typescript": "^5.0.0"
   },
   "dependencies": {

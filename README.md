@@ -13,7 +13,13 @@
 
 ## What is git-fission?
 
-`git-fission` analyzes your git commits and helps you split large, non-atomic commits into smaller, focused pieces. It uses AI (Claude via AWS Bedrock) to understand the semantic meaning of your changes and suggest logical splits.
+`git-fission` analyzes your git commits and helps you split large, non-atomic commits into smaller, focused pieces. It uses AI to understand the semantic meaning of your changes and suggest logical splits.
+
+**Supported LLM Providers:**
+- **Anthropic** (direct API)
+- **OpenAI**
+- **OpenRouter**
+- **AWS Bedrock**
 
 A commit is considered **atomic** if it:
 - Does **one thing** (single logical change)
@@ -66,7 +72,12 @@ git-fission --split HEAD -i "Keep test files in a separate commit"
 # Debug mode
 git-fission --split HEAD -L --debug --dry-run
 
-# Use a specific model
+# Use different providers
+git-fission --split HEAD -p anthropic                    # Anthropic (default model)
+git-fission --split HEAD -p openai -m gpt-4o             # OpenAI
+git-fission --split HEAD -m openrouter:anthropic/claude-3.5-haiku  # OpenRouter
+
+# Use a specific model (Bedrock)
 git-fission --split HEAD -m us.anthropic.claude-opus-4-5-20251101-v1:0
 ```
 
@@ -116,7 +127,8 @@ mno7890 test: Add user authentication tests
 | Option | Description |
 |--------|-------------|
 | `-v, --verbose` | Verbose output |
-| `-m, --model <id>` | Bedrock model ID (default: claude-sonnet-4) |
+| `-p, --provider <p>` | LLM provider: `bedrock`, `anthropic`, `openai`, `openrouter` |
+| `-m, --model <id>` | Model ID (or use `provider:model` format) |
 | `--split <commit>` | Split a commit (hunk-level, fast & stable) |
 | `-L, --line-level` | Use line-level splitting (experimental) |
 | `--dry-run` | Preview split without executing |
@@ -124,25 +136,70 @@ mno7890 test: Add user authentication tests
 | `-i, --instruction` | Custom instruction for LLM |
 | `-h, --help` | Show help |
 
+### Model Format
+
+You can specify the model in two ways:
+
+```bash
+# Using --provider and --model separately
+git-fission -p anthropic -m claude-3-5-sonnet-20241022
+
+# Using provider:model format (provider prefix)
+git-fission -m anthropic:claude-3-5-sonnet-20241022
+git-fission -m openai:gpt-4o
+git-fission -m openrouter:anthropic/claude-3.5-haiku
+```
+
 ## Environment Variables
 
 | Variable | Description |
 |----------|-------------|
+| `GIT_FISSION_PROVIDER` | Default provider (`bedrock`, `anthropic`, `openai`, `openrouter`) |
+| `GIT_FISSION_MODEL` | Default model |
+| `ANTHROPIC_API_KEY` | API key for Anthropic |
+| `OPENAI_API_KEY` | API key for OpenAI |
+| `OPENROUTER_API_KEY` | API key for OpenRouter |
 | `AWS_BEARER_TOKEN_BEDROCK` | Bearer token for Bedrock API |
 | `AWS_REGION` | AWS region (default: `us-west-2`) |
-| `GIT_FISSION_MODEL` | Default model |
 
-## Available Models
+## Available Models Providers
+
+### Anthropic (Direct API)
 
 | Model | Description |
 |-------|-------------|
-| `us.anthropic.claude-sonnet-4-20250514-v1:0` | Default (recommended) |
-| `us.anthropic.claude-3-5-haiku-20241022-v1:0` | Faster, less accurate |
+| `claude-3-5-haiku-20241022` | Default, fast |
+| `claude-3-5-sonnet-20241022` | Balanced |
+| `claude-sonnet-4-20250514` | Recommended |
+| `claude-opus-4-20250514` | Most capable |
+
+### OpenAI
+
+| Model | Description |
+|-------|-------------|
+| `gpt-5-mini-2025-08-07` | fast & cheap |
+| `gpt-5.2-2025-12-11` | High capability |
+
+### OpenRouter
+
+| Model | Description |
+|-------|-------------|
+| `anthropic/claude-3.5-haiku` | Default |
+| `anthropic/claude-3.5-sonnet` | Balanced |
+| `openai/gpt-4o` | OpenAI via OpenRouter |
+
+### AWS Bedrock
+
+| Model | Description |
+|-------|-------------|
+| `us.anthropic.claude-3-5-haiku-20241022-v1:0` | Default |
+| `us.anthropic.claude-sonnet-4-20250514-v1:0` | Recommended |
 | `us.anthropic.claude-opus-4-5-20251101-v1:0` | Most capable |
 
 ## Features
 
-- **LLM Analysis**: Deep semantic analysis using AWS Bedrock Claude models
+- **Multi-Provider Support**: Works with Anthropic, OpenAI, OpenRouter, and AWS Bedrock
+- **LLM Analysis**: Deep semantic analysis using state-of-the-art language models
 - **Auto-Split**: Automatically split large commits into atomic ones
 - **Hunk-Level Splitting**: Fast & stable, splits at diff hunk boundaries (default)
 - **Line-Level Splitting**: Experimental, splits individual lines within the same hunk (`-L`)
@@ -235,8 +292,12 @@ Use `--debug` to write intermediate results to `.git-fission-debug/<commit-hash>
 ## Requirements
 
 - Node.js 18+
-- AWS credentials configured
 - Git repository
+- API key for your chosen provider:
+  - **Anthropic**: `ANTHROPIC_API_KEY`
+  - **OpenAI**: `OPENAI_API_KEY`
+  - **OpenRouter**: `OPENROUTER_API_KEY`
+  - **AWS Bedrock**: AWS credentials or `AWS_BEARER_TOKEN_BEDROCK`
 
 ## License
 

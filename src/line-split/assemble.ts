@@ -1,8 +1,8 @@
 /**
  * Phase 4: Assemble patches from extracted changes
  *
- * Strategy: Instead of using absolute line numbers (which break when file state changes),
- * we track changes by hunk position and rebuild content progressively.
+ * New strategy: Instead of rebuilding file content and diffing, directly modify
+ * the hunk to only include selected changes. This is more reliable.
  */
 
 import { getFileAtRef, generateUnifiedDiff, type ParsedFileDiff, type ParsedHunk } from '../git.js';
@@ -15,141 +15,133 @@ export interface AssembledPatch {
   patch: string;
 }
 
-interface PatchBuildContext {
-  fileStates: Map<string, string>;
-  newFiles: Set<string>;
-  createdInPatch: Set<string>;
-}
-
 /**
- * Get the final state of a file after applying selected changes from hunks
+ * Modify a hunk to only include selected line changes
  *
- * This works by:
- * 1. Starting from the original file content
- * 2. Processing each hunk in order
- * 3. For each hunk, applying only the selected +/- lines
+ * For selected lines: keep as-is
+ * For unselected + lines: remove entirely
+ * For unselected - lines: convert to context (they stay in the file)
  */
-function buildFileContent(
-  originalContent: string,
-  hunks: ParsedHunk[],
-  selectedRanges: LineRange[]
-): string {
-  if (hunks.length === 0) return originalContent;
+function filterHunk(
+  hunk: ParsedHunk,
+  selectedIndices: Set<number>
+): { header: string; content: string; hasChanges: boolean } {
+  const hunkLines = hunk.content.split('\n');
+  const filteredLines: string[] = [];
 
-  // Build a map of which line indices are selected for each hunk
-  const selectedByHunk = new Map<number, Set<number>>();
-  for (const range of selectedRanges) {
-    if (!selectedByHunk.has(range.hunkId)) {
-      selectedByHunk.set(range.hunkId, new Set());
-    }
-    for (let i = range.startLineIdx; i <= range.endLineIdx; i++) {
-      selectedByHunk.get(range.hunkId)!.add(i);
-    }
+  // Parse original header to get line numbers
+  const headerMatch = hunk.header.match(/@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/);
+  if (!headerMatch) {
+    return { header: hunk.header, content: hunk.content, hasChanges: false };
   }
 
-  const originalLines = originalContent === '' ? [] : originalContent.split('\n');
-  const result: string[] = [];
-  let originalIdx = 0;  // Current position in original file
+  const oldStart = parseInt(headerMatch[1]);
+  const oldCountOriginal = headerMatch[2] ? parseInt(headerMatch[2]) : 1;
+  const newStart = parseInt(headerMatch[3]);
+  const suffix = headerMatch[5] || '';
 
-  for (const hunk of hunks) {
-    // Get hunk's starting position in original file
-    const headerMatch = hunk.header.match(/@@ -(\d+)/);
-    const hunkStartLine = headerMatch ? parseInt(headerMatch[1]) - 1 : 0;  // 0-indexed
+  let oldCount = 0;  // Lines in old file (context + deletions)
+  let newCount = 0;  // Lines in new file (context + additions)
+  let hasChanges = false;
 
-    // Copy lines before this hunk
-    while (originalIdx < hunkStartLine && originalIdx < originalLines.length) {
-      result.push(originalLines[originalIdx]);
-      originalIdx++;
-    }
+  for (let lineIdx = 0; lineIdx < hunkLines.length; lineIdx++) {
+    const line = hunkLines[lineIdx];
+    if (line === '' && lineIdx === hunkLines.length - 1) continue;
 
-    // Process hunk lines
-    const hunkLines = hunk.content.split('\n');
-    const selected = selectedByHunk.get(hunk.id) || new Set();
-
-    for (let lineIdx = 0; lineIdx < hunkLines.length; lineIdx++) {
-      const line = hunkLines[lineIdx];
-      if (line === '' && lineIdx === hunkLines.length - 1) continue;
-
-      if (line.startsWith('+')) {
-        // Addition - only include if selected
-        if (selected.has(lineIdx)) {
-          result.push(line.slice(1));
-        }
-      } else if (line.startsWith('-')) {
-        // Removal - skip original line if selected, keep if not selected
-        if (selected.has(lineIdx)) {
-          // Skip this line (it's being removed)
-          originalIdx++;
-        } else {
-          // Not selected - keep the original line
-          if (originalIdx < originalLines.length) {
-            result.push(originalLines[originalIdx]);
-          }
-          originalIdx++;
-        }
-      } else if (line.startsWith(' ')) {
-        // Context line - copy from original
-        if (originalIdx < originalLines.length) {
-          result.push(originalLines[originalIdx]);
-        }
-        originalIdx++;
+    if (line.startsWith('+')) {
+      if (selectedIndices.has(lineIdx)) {
+        // Keep the addition
+        filteredLines.push(line);
+        newCount++;
+        hasChanges = true;
       }
+      // Unselected additions are simply omitted
+    } else if (line.startsWith('-')) {
+      if (selectedIndices.has(lineIdx)) {
+        // Keep the deletion
+        filteredLines.push(line);
+        oldCount++;
+        hasChanges = true;
+      } else {
+        // Unselected deletion becomes context (the line stays)
+        filteredLines.push(' ' + line.slice(1));
+        oldCount++;
+        newCount++;
+      }
+    } else if (line.startsWith(' ')) {
+      // Context line - always keep
+      filteredLines.push(line);
+      oldCount++;
+      newCount++;
     }
   }
 
-  // Copy remaining lines after all hunks
-  while (originalIdx < originalLines.length) {
-    result.push(originalLines[originalIdx]);
-    originalIdx++;
-  }
+  // Build new header
+  const newHeader = `@@ -${oldStart},${oldCount} +${newStart},${newCount} @@${suffix}`;
 
-  return result.join('\n');
+  return {
+    header: newHeader,
+    content: filteredLines.join('\n'),
+    hasChanges,
+  };
 }
 
 /**
- * Initialize context with original file states
+ * Build a patch string from filtered hunks
  */
-function initializeContext(
-  files: ParsedFileDiff[],
-  commitHash: string
-): PatchBuildContext {
-  const fileStates = new Map<string, string>();
-  const newFiles = new Set<string>();
-  const createdInPatch = new Set<string>();
+function buildPatchFromHunks(
+  file: ParsedFileDiff,
+  filteredHunks: Array<{ header: string; content: string }>
+): string {
+  if (filteredHunks.length === 0) return '';
 
-  for (const file of files) {
-    const isNewFile = file.fileHeader.includes('new file mode') ||
-                      file.fileHeader.includes('--- /dev/null');
+  const parts: string[] = [];
 
-    if (isNewFile) {
-      newFiles.add(file.filePath);
-      fileStates.set(file.filePath, '');
-    } else {
-      const content = getFileAtRef(`${commitHash}~1`, file.filePath);
-      fileStates.set(file.filePath, content || '');
+  // Add file header
+  parts.push(`diff --git a/${file.filePath} b/${file.filePath}`);
+
+  // Check if new file
+  const isNewFile = file.fileHeader.includes('new file mode') ||
+                    file.fileHeader.includes('--- /dev/null');
+
+  if (isNewFile) {
+    parts.push('new file mode 100644');
+    parts.push('index 0000000..0000000');
+    parts.push('--- /dev/null');
+  } else {
+    parts.push('index 0000000..0000000 100644');
+    parts.push(`--- a/${file.filePath}`);
+  }
+  parts.push(`+++ b/${file.filePath}`);
+
+  // Add each hunk
+  for (const hunk of filteredHunks) {
+    parts.push(hunk.header);
+    if (hunk.content) {
+      parts.push(hunk.content);
     }
   }
 
-  return { fileStates, newFiles, createdInPatch };
+  return parts.join('\n') + '\n';
 }
 
 /**
  * Build patches for all commits
  *
- * Key insight: For each commit, we calculate what the file should look like
- * by starting from original and applying only the changes up to and including
- * this commit.
+ * New approach: For each file change, filter the original hunks to only include
+ * selected lines, then assemble those filtered hunks into a patch.
  */
 export function buildPatches(
   files: ParsedFileDiff[],
   commitChanges: CommitChanges[],
-  commitHash: string
+  _commitHash: string
 ): AssembledPatch[] {
-  const ctx = initializeContext(files, commitHash);
   const results: AssembledPatch[] = [];
 
-  // Track cumulative ranges per file (all ranges from commit 1 to N)
-  const cumulativeRangesByFile = new Map<string, LineRange[]>();
+  // Track which line indices have been used by previous commits (per hunk)
+  // This is needed for line-level splitting where different lines from the
+  // same hunk go to different commits
+  const usedIndicesByHunk = new Map<number, Set<number>>();
 
   for (const commit of commitChanges) {
     const patchParts: string[] = [];
@@ -161,6 +153,7 @@ export function buildPatches(
 
       const originalContent = ctx.fileStates.get(filePath) || '';
       const isNewFile = ctx.newFiles.has(filePath) && !ctx.createdInPatch.has(filePath);
+      }
 
       // Get previous cumulative ranges for this file
       const prevRanges = cumulativeRangesByFile.get(filePath) || [];
@@ -173,6 +166,8 @@ export function buildPatches(
       // Add this commit's ranges to cumulative
       const newCumulativeRanges = [...prevRanges, ...fileChange.ranges];
       cumulativeRangesByFile.set(filePath, newCumulativeRanges);
+
+
 
       // Target state = original + all changes up to and including this commit
       const targetContent = buildFileContent(originalContent, file.hunks, newCumulativeRanges);

@@ -51,8 +51,23 @@ git-fission
 ### Split a commit
 
 ```bash
-# Split the last commit into atomic pieces
-git-fission --split HEAD --model us.anthropic.claude-opus-4-5-20251101-v1:0
+# Hunk-level splitting (default, faster & more stable)
+git-fission --split HEAD
+
+# Line-level splitting (experimental, finer granularity)
+git-fission --split HEAD -L
+
+# Preview without executing
+git-fission --split HEAD --dry-run
+
+# With custom instruction
+git-fission --split HEAD -i "Keep test files in a separate commit"
+
+# Debug mode
+git-fission --split HEAD -L --debug --dry-run
+
+# Use a specific model
+git-fission --split HEAD -m us.anthropic.claude-opus-4-5-20251101-v1:0
 ```
 
 ## How it works
@@ -101,12 +116,13 @@ mno7890 test: Add user authentication tests
 | Option | Description |
 |--------|-------------|
 | `-v, --verbose` | Verbose output |
-| `--split <commit>` | Split a commit into atomic commits (default: HEAD) |
 | `-m, --model <id>` | Bedrock model ID (default: claude-sonnet-4) |
+| `--split <commit>` | Split a commit (hunk-level, fast & stable) |
+| `-L, --line-level` | Use line-level splitting (experimental) |
 | `--dry-run` | Preview split without executing |
+| `--debug` | Write intermediate results to `.git-fission-debug/` |
+| `-i, --instruction` | Custom instruction for LLM |
 | `-h, --help` | Show help |
-
-> **Note**: By default, git-fission checks only the last unpushed commit.
 
 ## Environment Variables
 
@@ -118,24 +134,29 @@ mno7890 test: Add user authentication tests
 
 ## Available Models
 
-| Model | Use Case |
-|-------|----------|
-| `us.anthropic.claude-3-5-haiku-20241022-v1:0` | Default for check (fast) |
-| `us.anthropic.claude-sonnet-4-20250514-v1:0` | Default for split (accurate) |
+| Model | Description |
+|-------|-------------|
+| `us.anthropic.claude-sonnet-4-20250514-v1:0` | Default (recommended) |
+| `us.anthropic.claude-3-5-haiku-20241022-v1:0` | Faster, less accurate |
+| `us.anthropic.claude-opus-4-5-20251101-v1:0` | Most capable |
 
 ## Features
 
 - **LLM Analysis**: Deep semantic analysis using AWS Bedrock Claude models
 - **Auto-Split**: Automatically split large commits into atomic ones
-- **Hunk-Level Splitting**: Splits at diff hunk boundaries (contiguous blocks of changes)
-- **Patch Validation**: Validates and auto-fixes common LLM patch generation issues
-- **Retry Logic**: Automatically retries with feedback if patch generation fails
+- **Hunk-Level Splitting**: Fast & stable, splits at diff hunk boundaries (default)
+- **Line-Level Splitting**: Experimental, splits individual lines within the same hunk (`-L`)
+- **Custom Instructions**: Guide the LLM with custom splitting rules
+- **Debug Mode**: Inspect intermediate results for troubleshooting
 
 ## How Splitting Works
 
-git-fission operates at the **hunk level**. A hunk is a contiguous block of changes in a diff (the sections starting with `@@`). The AI analyzes each hunk and classifies them into logical groups, then creates separate commits for each group.
+### Hunk-Level (Default) — Fast & Stable
 
+Operates at the **hunk level**. A hunk is a contiguous block of changes in a diff (the sections starting with `@@`). The AI analyzes each hunk and classifies them into logical groups.
 
+**Pros**: Fast (single LLM call), reliable patch generation
+**Cons**: Cannot split changes within the same hunk
 
 ```
 Original commit with 3 hunks in file.ts:
@@ -151,21 +172,64 @@ Original commit with 3 hunks in file.ts:
 └─────────────┘  └─────────────┘
 ```
 
-### Current Limitations
+### Line-Level (`-L` flag) — Experimental
 
+Operates at the **line level**, allowing changes within the same hunk to be split into different commits.
 
+**Pros**: Finer granularity, can split interleaved changes
+**Cons**: Slower (multiple LLM calls), may produce invalid patches
 
+Uses a 4-phase pipeline:
 
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  Phase 1        │     │  Phase 2        │     │  Phase 3        │     │  Phase 4        │
+│  Plan Commits   │ ──▶ │  Classify Lines │ ──▶ │  Extract Lines  │ ──▶ │  Build Patches  │
+│  (LLM)          │     │  (LLM per hunk) │     │  (Script)       │     │  (Script)       │
+└─────────────────┘     └─────────────────┘     └─────────────────┘     └─────────────────┘
+```
 
+1. **Phase 1 (Plan)**: LLM reads the entire diff and decides how many commits to create
+2. **Phase 2 (Classify)**: For each hunk, LLM decides which lines belong to which commit
+3. **Phase 3 (Extract)**: Script extracts line content from original diff (no LLM generation)
+4. **Phase 4 (Assemble)**: Script builds patches, handling cross-commit dependencies
 
-- **Hunk-level granularity**: If two logically separate changes are within the same hunk (close together in the file), they cannot be split apart
-- Works best when different concerns are in different parts of the file
+**Key Design**: LLM only makes decisions (which lines go where), script handles all diff generation. This avoids LLM formatting errors.
 
-### Future Work
+```
+Same hunk, different commits:
+┌─────────────────────────────────┐
+│ @@ -10,5 +10,12 @@              │
+│  context line                   │
+│ +import { auth } from './auth'  │ ← Commit A
+│ +import { cache } from './cache'│ ← Commit B
+│  context line                   │
+│ +function login() { ... }       │ ← Commit A
+│ +function initCache() { ... }   │ ← Commit B
+└─────────────────────────────────┘
+           ↓ git-fission -L
+┌─────────────┐  ┌─────────────┐
+│ Commit A    │  │ Commit B    │
+│ auth import │  │ cache import│
+│ login()     │  │ initCache() │
+└─────────────┘  └─────────────┘
+```
 
+### Debug Mode
 
-- **Line-level splitting**: Split individual lines within the same hunk into different commits (similar to `git add -p` interactive staging but automated)
+Use `--debug` to write intermediate results to `.git-fission-debug/<commit-hash>/`:
 
+```
+.git-fission-debug/abc1234/
+├── 00-original.diff           # Original diff
+├── 01-plan.json               # Phase 1: Commit plan from LLM
+├── 02-hunks.json              # Parsed hunks
+├── 03-classifications.json    # Phase 2: Line classifications
+├── 04-extracted.json          # Phase 3: Extracted line ranges
+├── 05-patch-1-commit_1.patch  # Phase 4: Generated patches
+├── 05-patch-2-commit_2.patch
+└── 05-patches-summary.json
+```
 
 ## Requirements
 

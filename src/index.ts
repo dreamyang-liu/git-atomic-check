@@ -7,7 +7,7 @@
  * your commits: analyze a large commit and split it into atomic pieces.
  */
 
-import { c, LOGO, DEFAULT_MODEL, SPLIT_MODEL } from './config.js';
+import { c, LOGO, DEFAULT_MODEL } from './config.js';
 import { runGit, getUnpushedCommits, getCommitInfo } from './git.js';
 import { checkCommitAtomicity, printReport } from './check.js';
 import { splitCommit } from './split.js';
@@ -19,7 +19,6 @@ async function main() {
     verbose: false,
     model: process.env.GIT_FISSION_MODEL || DEFAULT_MODEL,
     split: undefined as string | undefined,
-    splitModel: process.env.GIT_FISSION_SPLIT_MODEL || SPLIT_MODEL,
     dryRun: false,
     help: false,
     instruction: undefined as string | undefined,
@@ -30,9 +29,8 @@ async function main() {
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '-v' || arg === '--verbose') flags.verbose = true;
-    else if (arg === '--model') flags.model = args[++i];
+    else if (arg === '--model' || arg === '-m') flags.model = args[++i];
     else if (arg === '--split') flags.split = args[++i];
-    else if (arg === '--split-model') flags.splitModel = args[++i];
     else if (arg === '--dry-run') flags.dryRun = true;
     else if (arg === '-h' || arg === '--help') flags.help = true;
     else if (arg === '--instruction' || arg === '-i') flags.instruction = args[++i];
@@ -50,20 +48,18 @@ Use --split to split a non-atomic commit into smaller pieces.
 
 Options:
   -v, --verbose        Verbose output
-  --model <id>         Bedrock model ID for check analysis
-  --split <commit>     Split a commit into atomic commits (default: HEAD)
-  --split-model <id>   Model for split analysis
-  -L, --line-level     Use line-level splitting (finer granularity than hunk-level)
+  -m, --model <id>     Bedrock model ID (default: claude-sonnet-4)
+  --split <commit>     Split a commit (hunk-level, fast & stable)
+  -L, --line-level     Use line-level splitting (experimental)
   --dry-run            Preview split without executing
-  --debug              Write intermediate results to .git-fission-debug/ for debugging
-  -i, --instruction    Custom instruction for the LLM (e.g., "Keep test files separate")
+  --debug              Write intermediate results to .git-fission-debug/
+  -i, --instruction    Custom instruction for the LLM
   -h, --help           Show help
 
 Environment:
   AWS_BEARER_TOKEN_BEDROCK   Bearer token for Bedrock
   AWS_REGION                 AWS region (default: us-west-2)
-  GIT_FISSION_MODEL          Default model for check
-  GIT_FISSION_SPLIT_MODEL    Default model for split
+  GIT_FISSION_MODEL          Default model
 `);
     process.exit(0);
   }
@@ -77,7 +73,7 @@ Environment:
 
   // Split mode
   if (flags.split) {
-    const success = await splitCommit(flags.split, flags.splitModel, flags.dryRun, flags.lineLevel, flags.instruction, flags.debug);
+    const success = await splitCommit(flags.split, flags.model, flags.dryRun, flags.lineLevel, flags.instruction, flags.debug);
     process.exit(success ? 0 : 1);
   }
 

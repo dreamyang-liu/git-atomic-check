@@ -45,8 +45,7 @@ ln -s "$(pwd)/dist/index.js" ~/.local/bin/git-fission
 ### Check the last unpushed commit
 
 ```bash
-# Check the last unpushed commit for atomicity
-git-fission --model us.anthropic.claude-opus-4-5-20251101-v1:0
+git-fission
 ```
 
 ### Split a commit
@@ -102,9 +101,8 @@ mno7890 test: Add user authentication tests
 | Option | Description |
 |--------|-------------|
 | `-v, --verbose` | Verbose output |
-| `--model <id>` | Bedrock model ID for check analysis |
 | `--split <commit>` | Split a commit into atomic commits (default: HEAD) |
-| `--split-model <id>` | Model for split analysis |
+| `-m, --model <id>` | Bedrock model ID (default: claude-sonnet-4) |
 | `--dry-run` | Preview split without executing |
 | `-h, --help` | Show help |
 
@@ -116,8 +114,7 @@ mno7890 test: Add user authentication tests
 |----------|-------------|
 | `AWS_BEARER_TOKEN_BEDROCK` | Bearer token for Bedrock API |
 | `AWS_REGION` | AWS region (default: `us-west-2`) |
-| `GIT_FISSION_MODEL` | Default model for analysis |
-| `GIT_FISSION_SPLIT_MODEL` | Default model for split |
+| `GIT_FISSION_MODEL` | Default model |
 
 ## Available Models
 
@@ -138,6 +135,8 @@ mno7890 test: Add user authentication tests
 
 git-fission operates at the **hunk level**. A hunk is a contiguous block of changes in a diff (the sections starting with `@@`). The AI analyzes each hunk and classifies them into logical groups, then creates separate commits for each group.
 
+
+
 ```
 Original commit with 3 hunks in file.ts:
 ┌─────────────────────────────────┐
@@ -154,12 +153,19 @@ Original commit with 3 hunks in file.ts:
 
 ### Current Limitations
 
+
+
+
+
+
 - **Hunk-level granularity**: If two logically separate changes are within the same hunk (close together in the file), they cannot be split apart
 - Works best when different concerns are in different parts of the file
 
 ### Future Work
 
+
 - **Line-level splitting**: Split individual lines within the same hunk into different commits (similar to `git add -p` interactive staging but automated)
+
 
 ## Requirements
 

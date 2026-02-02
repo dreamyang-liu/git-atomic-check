@@ -35,4 +35,3 @@ ${c.dim}                  Split commits into atomic pieces${c.reset}
 
 // Model configuration
 export const DEFAULT_MODEL = 'us.anthropic.claude-3-5-haiku-20241022-v1:0';
-export const SPLIT_MODEL = 'us.anthropic.claude-sonnet-4-20250514-v1:0';

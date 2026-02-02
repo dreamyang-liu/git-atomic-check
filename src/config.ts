@@ -33,5 +33,12 @@ ${c.bold}${c.green}                        ⚛  git-fission${c.reset}
 ${c.dim}                  Split commits into atomic pieces${c.reset}
 `;
 
-// Model configuration
-export const DEFAULT_MODEL = 'us.anthropic.claude-3-5-haiku-20241022-v1:0';
+// Model configuration per provider
+export const DEFAULT_MODELS = {
+  bedrock: 'us.anthropic.claude-3-5-haiku-20241022-v1:0',
+  anthropic: 'claude-3-5-haiku-20241022',
+  openai: 'gpt-4o-mini',
+  openrouter: 'anthropic/claude-3.5-haiku',
+} as const;
+
+export const DEFAULT_PROVIDER = 'bedrock' as const;

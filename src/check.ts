@@ -4,11 +4,11 @@
 
 import { c } from './config.js';
 import { analyzeWithLLM } from './llm.js';
-import type { CommitInfo, AtomicityReport } from './types.js';
+import type { CommitInfo, AtomicityReport, LLMConfig } from './types.js';
 
 export async function checkCommitAtomicity(
   commit: CommitInfo,
-  model: string
+  config: LLMConfig
 ): Promise<AtomicityReport> {
   const issues: string[] = [];
   const warnings: string[] = [];
@@ -16,7 +16,7 @@ export async function checkCommitAtomicity(
 
   // LLM analysis
   process.stdout.write(`  ${c.dim}Analyzing with LLM...${c.reset}`);
-  const llmAnalysis = await analyzeWithLLM(commit, model) || undefined;
+  const llmAnalysis = await analyzeWithLLM(commit, config) || undefined;
   process.stdout.write('\r' + ' '.repeat(40) + '\r');
 
   let score = 50; // Default score

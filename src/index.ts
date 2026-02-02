@@ -7,7 +7,9 @@
  * your commits: analyze a large commit and split it into atomic pieces.
  */
 
-import { c, LOGO, DEFAULT_MODEL } from './config.js';
+import { c, LOGO, DEFAULT_MODELS, DEFAULT_PROVIDER } from './config.js';
+import { parseModelString } from './llm.js';
+import type { LLMProvider } from './types.js';
 import { runGit, getUnpushedCommits, getCommitInfo } from './git.js';
 import { checkCommitAtomicity, printReport } from './check.js';
 import { splitCommit } from './split.js';
@@ -15,9 +17,16 @@ import { splitCommit } from './split.js';
 async function main() {
   const args = process.argv.slice(2);
 
+  // Determine default provider from env
+  const envProvider = process.env.GIT_FISSION_PROVIDER as LLMProvider | undefined;
+  const defaultProvider: LLMProvider = envProvider && ['bedrock', 'anthropic', 'openai', 'openrouter'].includes(envProvider)
+    ? envProvider
+    : DEFAULT_PROVIDER;
+
   const flags = {
     verbose: false,
-    model: process.env.GIT_FISSION_MODEL || DEFAULT_MODEL,
+    model: process.env.GIT_FISSION_MODEL || DEFAULT_MODELS[defaultProvider],
+    provider: defaultProvider,
     split: undefined as string | undefined,
     dryRun: false,
     help: false,
@@ -30,6 +39,12 @@ async function main() {
     const arg = args[i];
     if (arg === '-v' || arg === '--verbose') flags.verbose = true;
     else if (arg === '--model' || arg === '-m') flags.model = args[++i];
+    else if (arg === '--provider' || arg === '-p') {
+      const p = args[++i] as LLMProvider;
+      if (['bedrock', 'anthropic', 'openai', 'openrouter'].includes(p)) {
+        flags.provider = p;
+      }
+    }
     else if (arg === '--split') flags.split = args[++i];
     else if (arg === '--dry-run') flags.dryRun = true;
     else if (arg === '-h' || arg === '--help') flags.help = true;
@@ -37,6 +52,9 @@ async function main() {
     else if (arg === '--line-level' || arg === '-L') flags.lineLevel = true;
     else if (arg === '--debug') flags.debug = true;
   }
+
+  // Parse model string - supports "provider:model" format or just "model"
+  const llmConfig = parseModelString(flags.model, flags.provider);
 
   if (flags.help) {
     console.log(`
@@ -48,7 +66,8 @@ Use --split to split a non-atomic commit into smaller pieces.
 
 Options:
   -v, --verbose        Verbose output
-  -m, --model <id>     Bedrock model ID (default: claude-sonnet-4)
+  -p, --provider <p>   LLM provider: bedrock, anthropic, openai, openrouter
+  -m, --model <id>     Model ID (or use provider:model format)
   --split <commit>     Split a commit (hunk-level, fast & stable)
   -L, --line-level     Use line-level splitting (experimental)
   --dry-run            Preview split without executing
@@ -56,10 +75,20 @@ Options:
   -i, --instruction    Custom instruction for the LLM
   -h, --help           Show help
 
+Model format:
+  --model claude-3-5-haiku-20241022           # Uses default provider
+  --model anthropic:claude-3-5-sonnet-20241022  # Explicit provider
+  --model openai:gpt-4o                       # OpenAI
+  --model openrouter:anthropic/claude-3.5-haiku # OpenRouter
+
 Environment:
+  GIT_FISSION_PROVIDER       Default provider (bedrock, anthropic, openai, openrouter)
+  GIT_FISSION_MODEL          Default model
+  ANTHROPIC_API_KEY          API key for Anthropic
+  OPENAI_API_KEY             API key for OpenAI
+  OPENROUTER_API_KEY         API key for OpenRouter
   AWS_BEARER_TOKEN_BEDROCK   Bearer token for Bedrock
   AWS_REGION                 AWS region (default: us-west-2)
-  GIT_FISSION_MODEL          Default model
 `);
     process.exit(0);
   }
@@ -73,7 +102,7 @@ Environment:
 
   // Split mode
   if (flags.split) {
-    const success = await splitCommit(flags.split, flags.model, flags.dryRun, flags.lineLevel, flags.instruction, flags.debug);
+    const success = await splitCommit(flags.split, llmConfig, flags.dryRun, flags.lineLevel, flags.instruction, flags.debug);
     process.exit(success ? 0 : 1);
   }
 
@@ -92,9 +121,9 @@ Environment:
   }
 
   console.log(LOGO);
-  console.log(`${c.bold}Checking last unpushed commit...${c.reset} [LLM: ${flags.model.split('/').pop()}]`);
+  console.log(`${c.bold}Checking last unpushed commit...${c.reset} [LLM: ${llmConfig.provider}:${llmConfig.model.split('/').pop()}]`);
 
-  const report = await checkCommitAtomicity(commit, flags.model);
+  const report = await checkCommitAtomicity(commit, llmConfig);
   printReport(report, flags.verbose);
 
   console.log(`\n${c.bold}${'─'.repeat(50)}${c.reset}`);
